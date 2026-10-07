@@ -13,12 +13,22 @@ import (
 	"orbitlink/internal/store"
 )
 
+// AttemptCoordinator supplies attempt lineage and starts replacement attempts
+// when the retry policy asks for one. *receiver.AttemptDispatcher implements it.
+type AttemptCoordinator interface {
+	Current(passID string) (receiver.Attempt, bool)
+	Begin(passID, chainID string) (receiver.Attempt, error)
+	ConsecutiveFailures(chainID string) int
+}
+
 type Service struct {
-	mu       sync.RWMutex
-	path     string
-	passes   map[string]Pass
-	recorder *recorder.Manager
-	audit    *audit.Trail
+	mu          sync.RWMutex
+	path        string
+	passes      map[string]Pass
+	recorder    *recorder.Manager
+	audit       *audit.Trail
+	attempts    AttemptCoordinator
+	retryPolicy receiver.RetryPolicy
 }
 
 func NewService(paths store.Paths, manager *recorder.Manager, trail *audit.Trail) (*Service, error) {
@@ -67,6 +77,16 @@ func (s *Service) Get(id string) (Pass, bool) {
 	return value, found
 }
 
+// ConfigureRetry installs the retry policy and the attempt coordinator used to
+// start replacement attempts. Without a coordinator, failed acquisitions keep
+// terminating the pass immediately.
+func (s *Service) ConfigureRetry(coordinator AttemptCoordinator, policy receiver.RetryPolicy) {
+	s.mu.Lock()
+	s.attempts = coordinator
+	s.retryPolicy = policy
+	s.mu.Unlock()
+}
+
 func (s *Service) List() []Pass {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -112,10 +132,44 @@ func (s *Service) ApplyAcquisitionResult(result receiver.AcquisitionResult) erro
 	if result.Locked && result.Synced {
 		value.Phase = Tracking
 		value.DecoderEpoch = result.Epoch
-	} else {
-		value.Phase = Failed
-		value.FailureReason = result.ErrorCode
+		value.UpdatedAt = time.Now().UTC()
+		s.passes[value.ID] = value
+		err := s.flushLocked()
+		s.mu.Unlock()
+		return err
 	}
+	reason := "retry-disabled"
+	if s.attempts != nil {
+		reason = "not-acquiring"
+		if value.Phase == Acquiring {
+			current, ok := s.attempts.Current(result.PassID)
+			if !ok || current.ID != result.AttemptID {
+				// The dispatcher already moved to a newer attempt; this result
+				// arrived too late and must not change the pass.
+				s.mu.Unlock()
+				_, _ = s.audit.Record(audit.Event{Component: "pass", Action: "stale-acquisition.ignored", Subject: result.PassID, Severity: audit.Warning, Fields: map[string]any{"attempt_id": result.AttemptID, "current_attempt": current.ID}})
+				return nil
+			}
+			decision := s.retryPolicy.Decide(receiver.RetryInput{
+				ErrorCode:       result.ErrorCode,
+				AttemptNumber:   current.Number,
+				RemainingWindow: time.Until(value.Window.LOS),
+				LinkHealthy:     s.retryPolicy.ChainHealthy(s.attempts.ConsecutiveFailures(result.ChainID)),
+			})
+			if decision.Retry {
+				attempt, err := s.retryLocked(&value, result)
+				s.mu.Unlock()
+				if err != nil {
+					return err
+				}
+				_, _ = s.audit.Record(audit.Event{Component: "pass", Action: "acquisition.retry", Subject: value.ID, Fields: map[string]any{"previous_attempt": result.AttemptID, "new_attempt": attempt.ID, "attempt_number": attempt.Number, "chain_id": result.ChainID, "error_code": result.ErrorCode}})
+				return nil
+			}
+			reason = decision.Reason
+		}
+	}
+	value.Phase = Failed
+	value.FailureReason = result.ErrorCode
 	value.UpdatedAt = time.Now().UTC()
 	s.passes[value.ID] = value
 	err := s.flushLocked()
@@ -123,10 +177,27 @@ func (s *Service) ApplyAcquisitionResult(result receiver.AcquisitionResult) erro
 	if err != nil {
 		return err
 	}
-	if value.Phase == Failed {
-		return s.recorder.StopForFailure(value.ID, result.AttemptID, result.ErrorCode)
+	_, _ = s.audit.Record(audit.Event{Component: "pass", Action: "acquisition.terminated", Subject: value.ID, Severity: audit.Warning, Fields: map[string]any{"attempt_id": result.AttemptID, "error_code": result.ErrorCode, "reason": reason}})
+	return s.recorder.StopForFailure(value.ID, result.AttemptID, result.ErrorCode)
+}
+
+// retryLocked starts a replacement attempt and re-arms the pass for acquisition.
+// The failed attempt keeps its delivered result in the dispatcher; the pass only
+// moves its current pointer, so a late result for the old attempt stays stale.
+func (s *Service) retryLocked(value *Pass, result receiver.AcquisitionResult) (receiver.Attempt, error) {
+	attempt, err := s.attempts.Begin(result.PassID, result.ChainID)
+	if err != nil {
+		return receiver.Attempt{}, err
 	}
-	return nil
+	value.Phase = Acquiring
+	value.CurrentAttemptID = attempt.ID
+	value.FailureReason = ""
+	value.UpdatedAt = time.Now().UTC()
+	s.passes[value.ID] = *value
+	if err := s.flushLocked(); err != nil {
+		return receiver.Attempt{}, err
+	}
+	return attempt, nil
 }
 
 func (s *Service) AcceptDiversity(passID string, results []receiver.AcquisitionResult) (receiver.DiversityDecision, error) {

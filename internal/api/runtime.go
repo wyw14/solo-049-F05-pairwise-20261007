@@ -111,6 +111,7 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 		return nil, err
 	}
 	attempts.SetSink(passes)
+	passes.ConfigureRetry(attempts, receiver.DefaultRetryPolicy())
 	recordingState := passsvc.NewRecordingState(passes, recorderManager)
 	handovers := handover.NewCoordinator(recordingState, recorderManager, trail)
 	stower := antenna.NewStowController(fleet, trail)

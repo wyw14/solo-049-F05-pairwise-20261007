@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -107,6 +108,36 @@ func (d *AttemptDispatcher) Current(passID string) (Attempt, bool) {
 	id := d.current[passID]
 	attempt, found := d.attempts[id]
 	return attempt, found
+}
+
+// ConsecutiveFailures counts trailing failed attempts on a receiver chain, newest
+// first. A locked attempt resets the streak; pending attempts have no outcome yet
+// and are skipped. The retry policy uses this as the chain's link-health signal.
+func (d *AttemptDispatcher) ConsecutiveFailures(chainID string) int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	attempts := make([]Attempt, 0, len(d.attempts))
+	for _, attempt := range d.attempts {
+		if attempt.ChainID == chainID {
+			attempts = append(attempts, attempt)
+		}
+	}
+	sort.Slice(attempts, func(i, j int) bool {
+		if attempts[i].StartedAt.Equal(attempts[j].StartedAt) {
+			return attempts[i].ID < attempts[j].ID
+		}
+		return attempts[i].StartedAt.Before(attempts[j].StartedAt)
+	})
+	failures := 0
+	for i := len(attempts) - 1; i >= 0; i-- {
+		switch attempts[i].Status {
+		case AttemptFailed:
+			failures++
+		case AttemptLocked:
+			return failures
+		}
+	}
+	return failures
 }
 
 func (d *AttemptDispatcher) List() []Attempt {

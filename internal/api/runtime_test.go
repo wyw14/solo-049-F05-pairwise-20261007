@@ -109,6 +109,61 @@ func TestEphemerisClockAndWindSafetyFlow(t *testing.T) {
 	}
 }
 
+func TestAcquisitionRetryAndLateResultFlow(t *testing.T) {
+	runtime := newTestRuntime(t)
+	value := runtime.Passes.List()[0]
+	attempt, err := runtime.Attempts.Begin(value.ID, "RF-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Passes.BeginAcquisition(value.ID, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	failure := receiver.AcquisitionResult{PassID: value.ID, AttemptID: attempt.ID, ChainID: "RF-01", ErrorCode: "NO-LOCK"}
+	if err := runtime.Attempts.Deliver(failure); err != nil {
+		t.Fatal(err)
+	}
+	updated, found := runtime.Passes.Get(value.ID)
+	if !found {
+		t.Fatal("pass disappeared")
+	}
+	if updated.Phase != passsvc.Acquiring {
+		t.Fatalf("transient failure should retry and keep acquiring, got %s", updated.Phase)
+	}
+	if updated.CurrentAttemptID == attempt.ID {
+		t.Fatal("retry did not replace the current attempt")
+	}
+	current, found := runtime.Attempts.Current(value.ID)
+	if !found || current.ID != updated.CurrentAttemptID || current.Number != attempt.Number+1 {
+		t.Fatalf("dispatcher and pass disagree on the retry attempt: %+v", current)
+	}
+	var preserved receiver.Attempt
+	for _, candidate := range runtime.Attempts.List() {
+		if candidate.ID == attempt.ID {
+			preserved = candidate
+		}
+	}
+	if preserved.Status != receiver.AttemptFailed || preserved.ErrorCode != "NO-LOCK" {
+		t.Fatalf("previous attempt result not preserved: %+v", preserved)
+	}
+	late := receiver.AcquisitionResult{PassID: value.ID, AttemptID: attempt.ID, ChainID: "RF-01", Locked: true, Synced: true, Epoch: 3}
+	if err := runtime.Attempts.Deliver(late); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ = runtime.Passes.Get(value.ID)
+	if updated.Phase != passsvc.Acquiring || updated.CurrentAttemptID != current.ID {
+		t.Fatalf("late result from the old attempt changed the pass: %+v", updated)
+	}
+	success := receiver.AcquisitionResult{PassID: value.ID, AttemptID: current.ID, ChainID: "RF-01", Locked: true, Synced: true, Epoch: 5}
+	if err := runtime.Attempts.Deliver(success); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ = runtime.Passes.Get(value.ID)
+	if updated.Phase != passsvc.Tracking || updated.DecoderEpoch != 5 {
+		t.Fatalf("retried attempt did not converge to tracking: %+v", updated)
+	}
+}
+
 func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	runtime := newTestRuntime(t)
 	first := runtime.Passes.List()[0]
