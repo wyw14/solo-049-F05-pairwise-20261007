@@ -18,6 +18,7 @@ type Attempt struct {
 	Status     AttemptStatus `json:"status"`
 	Epoch      int64         `json:"epoch"`
 	ErrorCode  string        `json:"error_code,omitempty"`
+	RetryOf    string        `json:"retry_of,omitempty"`
 	StartedAt  time.Time     `json:"started_at"`
 	FinishedAt time.Time     `json:"finished_at,omitempty"`
 }

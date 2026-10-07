@@ -109,6 +109,70 @@ func TestEphemerisClockAndWindSafetyFlow(t *testing.T) {
 	}
 }
 
+func TestAcquisitionRetryKeepsPassAcquiringAndIgnoresLateResults(t *testing.T) {
+	runtime := newTestRuntime(t)
+	value := runtime.Passes.List()[0]
+	attempt, err := runtime.Attempts.Begin(value.ID, "RF-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Passes.BeginAcquisition(value.ID, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+	target := server.URL + "/api/passes/" + value.ID + "/result"
+
+	failure := requestJSON(t, server.Client(), http.MethodPost, target,
+		`{"AttemptID":"`+attempt.ID+`","ChainID":"RF-01","Locked":false,"Synced":false,"ErrorCode":"NO-CARRIER"}`)
+	if failure.StatusCode != http.StatusOK {
+		t.Fatalf("failure delivery returned %d", failure.StatusCode)
+	}
+	var retry receiver.DeliveryOutcome
+	decodeBody(t, failure, &retry)
+	if retry.Kind != receiver.DeliveryRetry || retry.NewAttempt == nil || retry.NewAttempt.Number != 2 || retry.NewAttempt.RetryOf != attempt.ID {
+		t.Fatalf("failure did not spawn a retry attempt: %#v", retry)
+	}
+	current, found := runtime.Passes.Get(value.ID)
+	if !found || current.Phase != passsvc.Acquiring || current.CurrentAttemptID != retry.NewAttempt.ID {
+		t.Fatalf("pass did not stay acquiring on the retry attempt: %#v", current)
+	}
+
+	late := requestJSON(t, server.Client(), http.MethodPost, target,
+		`{"AttemptID":"`+attempt.ID+`","ChainID":"RF-01","Locked":true,"Synced":true,"Epoch":7}`)
+	if late.StatusCode != http.StatusOK {
+		t.Fatalf("late delivery returned %d", late.StatusCode)
+	}
+	var stale receiver.DeliveryOutcome
+	decodeBody(t, late, &stale)
+	if stale.Kind != receiver.DeliveryStale {
+		t.Fatalf("late lock on the old attempt must be stale, got %#v", stale)
+	}
+	current, _ = runtime.Passes.Get(value.ID)
+	if current.Phase != passsvc.Acquiring || current.CurrentAttemptID != retry.NewAttempt.ID {
+		t.Fatalf("late result changed the current pass: %#v", current)
+	}
+
+	lock := requestJSON(t, server.Client(), http.MethodPost, target,
+		`{"AttemptID":"`+retry.NewAttempt.ID+`","ChainID":"RF-01","Locked":true,"Synced":true,"Epoch":7}`)
+	if lock.StatusCode != http.StatusOK {
+		t.Fatalf("lock delivery returned %d", lock.StatusCode)
+	}
+	var applied receiver.DeliveryOutcome
+	decodeBody(t, lock, &applied)
+	if applied.Kind != receiver.DeliveryApplied {
+		t.Fatalf("lock on the current attempt must apply, got %#v", applied)
+	}
+	current, _ = runtime.Passes.Get(value.ID)
+	if current.Phase != passsvc.Tracking || current.DecoderEpoch != 7 {
+		t.Fatalf("pass did not enter tracking: %#v", current)
+	}
+}
+
 func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	runtime := newTestRuntime(t)
 	first := runtime.Passes.List()[0]

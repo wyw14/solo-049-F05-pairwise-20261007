@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"orbitlink/internal/antenna"
 	passsvc "orbitlink/internal/pass"
 	"orbitlink/internal/receiver"
 )
@@ -180,11 +181,36 @@ func (r *Runtime) deliverAcquisitionResult(writer http.ResponseWriter, request *
 		return
 	}
 	result.PassID = id
-	if err := r.Attempts.Deliver(result); err != nil {
+	outcome, err := r.Attempts.Deliver(result, r.retrySignals(id, result.ChainID))
+	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"delivered": true})
+	if outcome.NewAttempt != nil {
+		if err := r.Passes.BeginAcquisition(id, outcome.NewAttempt.ID); err != nil {
+			writeError(writer, err)
+			return
+		}
+	}
+	writeJSON(writer, http.StatusOK, outcome)
+}
+
+// retrySignals snapshots the remaining pass window and link health the retry policy evaluates.
+func (r *Runtime) retrySignals(passID, chainID string) receiver.RetrySignals {
+	signals := receiver.RetrySignals{LinkHealthy: true}
+	if value, found := r.Passes.Get(passID); found {
+		signals.RemainingWindow = value.Window.LOS.Sub(r.Clock.Now())
+		if state, ok := r.Antennas.State(value.AntennaID); ok {
+			switch state.Mode {
+			case antenna.Stowing, antenna.Stowed, antenna.Fault:
+				signals.LinkHealthy = false
+			}
+		}
+	}
+	if state, found := r.RF.State(chainID); !found || state.InhibitOperation != "" {
+		signals.LinkHealthy = false
+	}
+	return signals
 }
 
 func (r *Runtime) cancelPass(writer http.ResponseWriter, request *http.Request) {
